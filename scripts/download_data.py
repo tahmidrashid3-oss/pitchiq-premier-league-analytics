@@ -6,19 +6,17 @@ import pandas as pd
 import requests
 
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-BASE_URL = "https://www.football-data.co.uk/mmz4281"
+ROOT = Path(__file__).resolve().parents[1]
+RAW_DIR = ROOT / "data" / "raw"
 
-RAW_DIR = Path(__file__).resolve().parents[1] / "data" / "raw"
+RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-# Premier League seasons: 2015/16 to 2025/26
-SEASONS = [
-    f"{year:02d}{(year + 1) % 100:02d}"
-    for year in range(15, 26)
-]
+START_YEAR = 2015
+END_YEAR = 2025
 
 REQUIRED_COLUMNS = [
     "Date",
@@ -26,128 +24,114 @@ REQUIRED_COLUMNS = [
     "AwayTeam",
     "FTHG",
     "FTAG",
-    "FTR"
+    "FTR",
 ]
 
 
-# --------------------------------------------------
-# Download and clean a single season
-# --------------------------------------------------
+# ============================================================
+# DOWNLOAD PREMIER LEAGUE DATA
+# ============================================================
 
-def download_season(season):
-    """Download and validate one Premier League season."""
+def download_season(year):
+    season = f"{year % 100:02d}{(year + 1) % 100:02d}"
 
-    url = f"{BASE_URL}/{season}/E0.csv"
+    url = (
+        f"https://www.football-data.co.uk/mmz4281/"
+        f"{season}/E0.csv"
+    )
 
-    print(f"Downloading season {season}...")
+    print(f"\nDownloading season {season}...")
 
-    # Download CSV data
     response = requests.get(url, timeout=30)
     response.raise_for_status()
 
-    # Load CSV into a DataFrame
     df = pd.read_csv(BytesIO(response.content))
 
-    # Check required columns exist
-    missing = set(REQUIRED_COLUMNS) - set(df.columns)
+    missing_columns = [
+        column
+        for column in REQUIRED_COLUMNS
+        if column not in df.columns
+    ]
 
-    if missing:
+    if missing_columns:
         raise ValueError(
-            f"Season {season} is missing columns: {missing}"
+            f"Missing columns in season {season}: "
+            f"{missing_columns}"
         )
 
-    # Keep only the columns needed for analysis
     df = df[REQUIRED_COLUMNS].copy()
 
-    # Remove rows with missing essential information
-    df = df.dropna(subset=REQUIRED_COLUMNS)
-
-    # Convert match dates to datetime
+    # Parse the ORIGINAL Football-Data dates as UK dates.
+    # This prevents day/month values being reversed.
     df["Date"] = pd.to_datetime(
         df["Date"],
         format="mixed",
         dayfirst=True,
-        errors="coerce"
+        errors="raise"
     )
 
-    # Convert goals to numeric values
+    df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
+
     df["FTHG"] = pd.to_numeric(
         df["FTHG"],
-        errors="coerce"
+        errors="raise"
     )
 
     df["FTAG"] = pd.to_numeric(
         df["FTAG"],
-        errors="coerce"
+        errors="raise"
     )
 
-    # Remove rows with invalid dates or scores
-    df = df.dropna(subset=["Date", "FTHG", "FTAG"])
-
-    # Add season identifier
     df["Season"] = season
 
-    # Sort matches chronologically
-    df = df.sort_values("Date").reset_index(drop=True)
+    if len(df) != 380:
+        raise ValueError(
+            f"Expected 380 matches for {season}, "
+            f"found {len(df)}."
+        )
+
+    if df.isna().any().any():
+        raise ValueError(
+            f"Missing values detected in season {season}."
+        )
+
+    output_file = (
+        RAW_DIR / f"premier_league_{season}.csv"
+    )
+
+    df.to_csv(output_file, index=False)
+
+    print(f"Saved {len(df)} matches to {output_file.name}")
 
     return df
 
 
-# --------------------------------------------------
-# Download all seasons
-# --------------------------------------------------
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-
-    # Create raw data directory if necessary
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-
     all_seasons = []
 
-    for season in SEASONS:
+    for year in range(START_YEAR, END_YEAR + 1):
+        season_df = download_season(year)
+        all_seasons.append(season_df)
 
-        df = download_season(season)
-
-        # Save season data
-        output = RAW_DIR / f"premier_league_{season}.csv"
-
-        df.to_csv(output, index=False)
-
-        print(
-            f"Saved {len(df)} matches "
-            f"to {output.name}"
-        )
-
-        all_seasons.append(df)
-
-    # Combine all seasons
     combined = pd.concat(
         all_seasons,
         ignore_index=True
     )
 
-    # Sort complete dataset by date
-    combined = combined.sort_values(
-        "Date"
-    ).reset_index(drop=True)
+    print("\nDOWNLOAD COMPLETE")
+    print("Total matches:", len(combined))
+    print("Total seasons:", combined["Season"].nunique())
 
-    print("\nDownload complete!")
-    print(f"Total matches: {len(combined)}")
-    print(
-        f"Total seasons: "
-        f"{combined['Season'].nunique()}"
-    )
+    print("\nMatches per season:")
+    print(combined.groupby("Season").size())
 
-    print("\nFirst five matches:")
-    print(combined.head())
+    print("\nMissing values:")
+    print(combined.isna().sum())
 
-    print("\nLast five matches:")
-    print(combined.tail())
-
-
-# --------------------------------------------------
-# Run script
-# --------------------------------------------------
 
 if __name__ == "__main__":
     main()
