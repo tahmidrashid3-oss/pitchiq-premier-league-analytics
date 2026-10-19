@@ -1,0 +1,3 @@
+Model,Temperature,Accuracy,LogLoss,BrierScore,DrawPredictions
+Tuned Logistic Regression + xG,1.0,0.4921052631578947,1.0484877546596487,0.631948329758457,0
+Temperature-Calibrated Logistic Regression + xG,0.9951515893268197,0.4921052631578947,1.0486218465011552,0.6320402654237347,0
