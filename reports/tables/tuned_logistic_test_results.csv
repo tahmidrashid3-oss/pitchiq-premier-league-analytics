@@ -1,0 +1,2 @@
+Model,C,Accuracy,LogLoss,BrierScore,DrawPredictions
+Tuned Logistic Regression + xG,0.01,0.4921052631578947,1.0484877546596487,0.631948329758457,0
