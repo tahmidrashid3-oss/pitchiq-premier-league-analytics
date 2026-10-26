@@ -222,3 +222,11 @@ __marimo__/
 data/raw/
 data/processed/
 __pycache__/
+
+# Deployment assets
+!data/processed/
+data/processed/*
+!data/processed/premier_league_with_xg.csv
+
+# Local dashboard backup
+app_backup.py
