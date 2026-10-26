@@ -5,40 +5,22 @@ from io import BytesIO
 import pandas as pd
 import requests
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 ROOT = Path(__file__).resolve().parents[1]
 RAW_DIR = ROOT / "data" / "raw"
-
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
 START_YEAR = 2015
-END_YEAR = 2025
+END_YEAR = 2026
 
 REQUIRED_COLUMNS = [
-    "Date",
-    "HomeTeam",
-    "AwayTeam",
-    "FTHG",
-    "FTAG",
-    "FTR",
+    "Date", "HomeTeam", "AwayTeam",
+    "FTHG", "FTAG", "FTR"
 ]
 
 
-# ============================================================
-# DOWNLOAD PREMIER LEAGUE DATA
-# ============================================================
-
 def download_season(year):
     season = f"{year % 100:02d}{(year + 1) % 100:02d}"
-
-    url = (
-        f"https://www.football-data.co.uk/mmz4281/"
-        f"{season}/E0.csv"
-    )
+    url = f"https://www.football-data.co.uk/mmz4281/{season}/E0.csv"
 
     print(f"\nDownloading season {season}...")
 
@@ -47,22 +29,15 @@ def download_season(year):
 
     df = pd.read_csv(BytesIO(response.content))
 
-    missing_columns = [
-        column
-        for column in REQUIRED_COLUMNS
-        if column not in df.columns
-    ]
-
-    if missing_columns:
-        raise ValueError(
-            f"Missing columns in season {season}: "
-            f"{missing_columns}"
-        )
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns for {season}: {missing}")
 
     df = df[REQUIRED_COLUMNS].copy()
 
-    # Parse the ORIGINAL Football-Data dates as UK dates.
-    # This prevents day/month values being reversed.
+    # In an ongoing season, future fixtures may have no final score.
+    df = df.dropna(subset=["FTHG", "FTAG", "FTR"]).copy()
+
     df["Date"] = pd.to_datetime(
         df["Date"],
         format="mixed",
@@ -70,67 +45,64 @@ def download_season(year):
         errors="raise"
     )
 
+    df["FTHG"] = pd.to_numeric(df["FTHG"], errors="raise")
+    df["FTAG"] = pd.to_numeric(df["FTAG"], errors="raise")
+
+    if (df[["FTHG", "FTAG"]] < 0).any().any():
+        raise ValueError(f"Negative goals in {season}")
+
+    if not df["FTR"].isin(["H", "D", "A"]).all():
+        raise ValueError(f"Invalid results in {season}")
+
+    expected_results = df.apply(
+        lambda r: "H" if r["FTHG"] > r["FTAG"]
+        else "A" if r["FTHG"] < r["FTAG"]
+        else "D",
+        axis=1
+    )
+
+    if not expected_results.eq(df["FTR"]).all():
+        raise ValueError(f"Score/result mismatch in {season}")
+
+    if df.duplicated(["HomeTeam", "AwayTeam"]).any():
+        raise ValueError(f"Duplicate fixtures in {season}")
+
+    if year < END_YEAR and len(df) != 380:
+        raise ValueError(
+            f"Expected 380 matches for {season}, found {len(df)}"
+        )
+
+    if year == END_YEAR and not 0 < len(df) <= 380:
+        raise ValueError(
+            f"Invalid current-season match count: {len(df)}"
+        )
+
     df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
-
-    df["FTHG"] = pd.to_numeric(
-        df["FTHG"],
-        errors="raise"
-    )
-
-    df["FTAG"] = pd.to_numeric(
-        df["FTAG"],
-        errors="raise"
-    )
-
+    df["FTHG"] = df["FTHG"].astype(int)
+    df["FTAG"] = df["FTAG"].astype(int)
     df["Season"] = season
 
-    if len(df) != 380:
-        raise ValueError(
-            f"Expected 380 matches for {season}, "
-            f"found {len(df)}."
-        )
+    output = RAW_DIR / f"premier_league_{season}.csv"
+    df.to_csv(output, index=False)
 
-    if df.isna().any().any():
-        raise ValueError(
-            f"Missing values detected in season {season}."
-        )
-
-    output_file = (
-        RAW_DIR / f"premier_league_{season}.csv"
-    )
-
-    df.to_csv(output_file, index=False)
-
-    print(f"Saved {len(df)} matches to {output_file.name}")
-
+    print(f"Saved {len(df)} completed matches")
     return df
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 def main():
-    all_seasons = []
+    all_seasons = [
+        download_season(year)
+        for year in range(START_YEAR, END_YEAR + 1)
+    ]
 
-    for year in range(START_YEAR, END_YEAR + 1):
-        season_df = download_season(year)
-        all_seasons.append(season_df)
-
-    combined = pd.concat(
-        all_seasons,
-        ignore_index=True
-    )
+    combined = pd.concat(all_seasons, ignore_index=True)
 
     print("\nDOWNLOAD COMPLETE")
     print("Total matches:", len(combined))
     print("Total seasons:", combined["Season"].nunique())
-
     print("\nMatches per season:")
     print(combined.groupby("Season").size())
-
-    print("\nMissing values:")
-    print(combined.isna().sum())
+    print("\nLatest match:", combined["Date"].max())
 
 
 if __name__ == "__main__":
