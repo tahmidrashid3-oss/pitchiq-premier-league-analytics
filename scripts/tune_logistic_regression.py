@@ -3,12 +3,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.frozen import FrozenEstimator
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, log_loss
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, log_loss
 
 
 # ============================================================
@@ -17,23 +18,12 @@ from sklearn.metrics import accuracy_score, log_loss
 
 ROOT = Path(__file__).resolve().parents[1]
 
-DATA_FILE = ROOT / "data" / "processed" / "match_features.csv"
+DATA_FILE = (
+    ROOT / "data" / "processed"
+    / "match_features_advanced.csv"
+)
 
-TABLES_DIR = ROOT / "reports" / "tables"
-FIGURES_DIR = ROOT / "reports" / "figures"
-
-TABLES_DIR.mkdir(parents=True, exist_ok=True)
-FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-
-FEATURES = [
-    "Diff_Points",
-    "Diff_GoalsFor",
-    "Diff_GoalsAgainst",
-    "Diff_xGFor",
-    "Diff_xGAgainst",
-]
-
-CLASSES = ["H", "D", "A"]
+OUTPUT_DIR = ROOT / "reports" / "tables"
 
 VALIDATION_SEASONS = [
     "2122",
@@ -42,26 +32,53 @@ VALIDATION_SEASONS = [
     "2425",
 ]
 
-TEST_SEASON = "2526"
+# 2025/26 and 2026/27 remain outside model selection.
+C_VALUES = [0.001, 0.01, 0.1, 1.0, 10.0]
 
-C_VALUES = [
-    0.001,
-    0.01,
-    0.1,
-    1.0,
-    10.0,
-    100.0,
+CALIBRATION_METHODS = [
+    "none",
+    "sigmoid",
+    "isotonic",
 ]
+
+CLASSES = ["A", "D", "H"]
+
+METRICS = [
+    "Points",
+    "GoalsFor",
+    "GoalsAgainst",
+    "xGFor",
+    "xGAgainst",
+]
+
+WINDOWS = [3, 5, 10]
+
+# Preserve the exact deployed model feature ordering:
+# all Overall features, followed by all Venue features.
+OVERALL_FEATURES = [
+    f"Diff_Overall_{metric}_Last{window}"
+    for window in WINDOWS
+    for metric in METRICS
+]
+
+VENUE_FEATURES = [
+    f"Diff_Venue_{metric}_Last{window}"
+    for window in WINDOWS
+    for metric in METRICS
+]
+
+FEATURES = OVERALL_FEATURES + VENUE_FEATURES
 
 
 # ============================================================
-# DATA LOADING
+# LOAD AND VALIDATE DATA
 # ============================================================
 
 def load_data():
+
     if not DATA_FILE.exists():
         raise FileNotFoundError(
-            f"Feature file not found: {DATA_FILE}"
+            f"Missing dataset: {DATA_FILE}"
         )
 
     df = pd.read_csv(
@@ -81,7 +98,8 @@ def load_data():
     ] + FEATURES
 
     missing = [
-        column for column in required
+        column
+        for column in required
         if column not in df.columns
     ]
 
@@ -92,28 +110,39 @@ def load_data():
 
     if df[required].isna().any().any():
         raise ValueError(
-            "Missing values detected."
+            "Missing values detected in the dataset."
         )
 
     if not df["FTR"].isin(CLASSES).all():
         raise ValueError(
-            "Unexpected match outcome detected."
+            "Invalid match outcomes detected."
+        )
+
+    if df.duplicated(
+        ["Season", "HomeTeam", "AwayTeam"]
+    ).any():
+        raise ValueError(
+            "Duplicate fixtures detected."
+        )
+
+    if len(FEATURES) != 30:
+        raise ValueError(
+            f"Expected 30 features, found {len(FEATURES)}."
         )
 
     df = df.sort_values(
-        ["Date", "HomeTeam", "AwayTeam"]
+        ["Date", "Season", "HomeTeam", "AwayTeam"]
     ).reset_index(drop=True)
-
-    print(f"Loaded {len(df)} matches")
 
     return df
 
 
 # ============================================================
-# MODEL
+# BUILD LOGISTIC REGRESSION MODEL
 # ============================================================
 
-def create_model(c_value):
+def build_model(c):
+
     return Pipeline([
         (
             "scaler",
@@ -122,7 +151,7 @@ def create_model(c_value):
         (
             "model",
             LogisticRegression(
-                C=c_value,
+                C=c,
                 max_iter=3000,
                 random_state=42,
             ),
@@ -131,328 +160,399 @@ def create_model(c_value):
 
 
 # ============================================================
-# METRICS
+# CHRONOLOGICAL DATA SPLIT
 # ============================================================
 
-def evaluate_model(model, X, y):
-    """
-    Evaluate probabilities using the correct class order.
-    """
+def split_historical_data(train):
 
-    raw_probabilities = model.predict_proba(X)
+    seasons = sorted(
+        train["Season"].unique()
+    )
 
+    if len(seasons) < 2:
+        raise ValueError(
+            "At least two historical seasons are "
+            "required for calibration."
+        )
+
+    calibration_season = seasons[-1]
+
+    base_train = train[
+        train["Season"] < calibration_season
+    ].copy()
+
+    calibration_data = train[
+        train["Season"] == calibration_season
+    ].copy()
+
+    if base_train.empty or calibration_data.empty:
+        raise ValueError(
+            "Base training or calibration data is empty."
+        )
+
+    for name, subset in [
+        ("Base training", base_train),
+        ("Calibration", calibration_data),
+    ]:
+        if set(subset["FTR"]) != set(CLASSES):
+            raise ValueError(
+                f"{name} data is missing an outcome class."
+            )
+
+    if (
+        base_train["Date"].max()
+        >= calibration_data["Date"].min()
+    ):
+        raise ValueError(
+            "Chronological overlap between base training "
+            "and calibration data."
+        )
+
+    return base_train, calibration_data
+
+
+# ============================================================
+# TRAIN CANDIDATE MODEL
+# ============================================================
+
+def train_candidate(train, c, method):
+
+    if method not in CALIBRATION_METHODS + ["none_base"]:
+        raise ValueError(
+            f"Unsupported method: {method}"
+        )
+
+    # Existing deployment configuration:
+    # fit on all available historical training data.
+    if method == "none":
+        model = build_model(c)
+
+        model.fit(
+            train[FEATURES],
+            train["FTR"],
+        )
+
+        return model
+
+    base_train, calibration_data = (
+        split_historical_data(train)
+    )
+
+    # Fair control: an uncalibrated model trained
+    # on the same base data as calibrated models.
+    base_model = build_model(c)
+
+    base_model.fit(
+        base_train[FEATURES],
+        base_train["FTR"],
+    )
+
+    if method == "none_base":
+        return base_model
+
+    # FrozenEstimator prevents refitting the base model.
+    # Calibration is fitted only on the reserved season.
+    calibrated_model = CalibratedClassifierCV(
+        estimator=FrozenEstimator(base_model),
+        method=method,
+    )
+
+    calibrated_model.fit(
+        calibration_data[FEATURES],
+        calibration_data["FTR"],
+    )
+
+    return calibrated_model
+
+
+# ============================================================
+# EVALUATION METRICS
+# ============================================================
+
+def evaluate_model(model, validation):
+
+    actual = validation["FTR"].to_numpy()
+
+    raw_probabilities = model.predict_proba(
+        validation[FEATURES]
+    )
+
+    # Align all probabilities to A, D, H.
     probabilities = pd.DataFrame(
         raw_probabilities,
         columns=model.classes_,
     )[CLASSES].to_numpy()
 
-    predictions = np.array(CLASSES)[
+    predicted = np.array(CLASSES)[
         np.argmax(probabilities, axis=1)
     ]
 
     accuracy = accuracy_score(
-        y,
-        predictions,
+        actual,
+        predicted,
     )
-
-    # Correct log loss using alphabetical class order.
-    sklearn_probabilities = pd.DataFrame(
-        raw_probabilities,
-        columns=model.classes_,
-    )[["A", "D", "H"]].to_numpy()
 
     loss = log_loss(
-        y,
-        sklearn_probabilities,
-        labels=["A", "D", "H"],
+        actual,
+        probabilities,
+        labels=CLASSES,
     )
 
-    actual = (
-        np.asarray(y)[:, None]
+    one_hot = (
+        actual[:, None]
         == np.array(CLASSES)[None, :]
     ).astype(float)
 
     brier = np.mean(
         np.sum(
-            (probabilities - actual) ** 2,
+            (probabilities - one_hot) ** 2,
             axis=1,
         )
     )
 
-    draws = int(
-        np.sum(predictions == "D")
+    actual_draws = actual == "D"
+    predicted_draws = predicted == "D"
+
+    draw_count = int(
+        actual_draws.sum()
     )
 
+    correct_draws = int(
+        (actual_draws & predicted_draws).sum()
+    )
+
+    draw_recall = (
+        correct_draws / draw_count
+        if draw_count > 0
+        else np.nan
+    )
+
+    draw_probability = probabilities[
+        :, CLASSES.index("D")
+    ]
+
     return {
+        "Matches": len(validation),
         "Accuracy": accuracy,
         "LogLoss": loss,
         "BrierScore": brier,
-        "DrawPredictions": draws,
-    }, predictions, probabilities
+        "DrawPredictions": int(
+            predicted_draws.sum()
+        ),
+        "ActualDraws": draw_count,
+        "CorrectDraws": correct_draws,
+        "DrawRecall": draw_recall,
+        "MeanDrawProbability": float(
+            draw_probability.mean()
+        ),
+        "ActualDrawRate": float(
+            actual_draws.mean()
+        ),
+    }
 
 
 # ============================================================
-# ROLLING-SEASON VALIDATION
+# RUN EXPERIMENTS
 # ============================================================
 
-def tune_regularisation(df):
-    print("\n" + "=" * 70)
-    print("LOGISTIC REGRESSION REGULARISATION TUNING")
+def main():
+
     print("=" * 70)
+    print("PITCHIQ - LOGISTIC REGRESSION TUNING")
+    print("=" * 70)
+
+    df = load_data()
+
+    print("\nDataset matches:", len(df))
+    print("Model features:", len(FEATURES))
 
     results = []
 
-    for c_value in C_VALUES:
-        print(f"\nTesting C = {c_value}")
+    # Extra control for calibration comparisons.
+    methods = [
+        "none",
+        "none_base",
+        "sigmoid",
+        "isotonic",
+    ]
 
-        for season in VALIDATION_SEASONS:
-            train = df[df["Season"] < season]
-            validation = df[df["Season"] == season]
+    for season in VALIDATION_SEASONS:
 
-            if train.empty or validation.empty:
-                raise ValueError(
-                    f"Missing data for season {season}"
+        train = df[
+            df["Season"] < season
+        ].copy()
+
+        validation = df[
+            df["Season"] == season
+        ].copy()
+
+        if train.empty or validation.empty:
+            raise ValueError(
+                f"Missing training or validation data "
+                f"for season {season}."
+            )
+
+        if set(train["FTR"]) != set(CLASSES):
+            raise ValueError(
+                f"Missing training outcome class: {season}"
+            )
+
+        if (
+            train["Date"].max()
+            >= validation["Date"].min()
+        ):
+            raise ValueError(
+                f"Chronological overlap for season {season}."
+            )
+
+        print("\n" + "-" * 70)
+        print("Validation season:", season)
+        print("Training matches:", len(train))
+        print("Validation matches:", len(validation))
+        print("-" * 70)
+
+        for c in C_VALUES:
+
+            for method in methods:
+
+                model = train_candidate(
+                    train,
+                    c,
+                    method,
                 )
 
-            model = create_model(c_value)
+                scores = evaluate_model(
+                    model,
+                    validation,
+                )
 
-            model.fit(
-                train[FEATURES],
-                train["FTR"],
-            )
+                results.append({
+                    "Season": season,
+                    "C": c,
+                    "Calibration": method,
+                    **scores,
+                })
 
-            metrics, _, _ = evaluate_model(
-                model,
-                validation[FEATURES],
-                validation["FTR"],
-            )
+                print(
+                    f"C={c:<6} "
+                    f"Method={method:<10} "
+                    f"Accuracy={scores['Accuracy']:.2%} "
+                    f"LogLoss={scores['LogLoss']:.4f} "
+                    f"DrawRecall={scores['DrawRecall']:.2%}"
+                )
 
-            results.append({
-                "C": c_value,
-                "Season": season,
-                "Matches": len(validation),
-                **metrics,
-            })
-
-            print(
-                f"  {season} | "
-                f"Accuracy: {metrics['Accuracy']:.4f} | "
-                f"Log loss: {metrics['LogLoss']:.4f} | "
-                f"Brier: {metrics['BrierScore']:.4f}"
-            )
+    # ========================================================
+    # SAVE DETAILED RESULTS
+    # ========================================================
 
     results_df = pd.DataFrame(results)
 
-    results_df.to_csv(
-        TABLES_DIR / "logistic_tuning_results.csv",
-        index=False,
-    )
+    # ========================================================
+    # SUMMARISE ACROSS SEASONS
+    # ========================================================
 
     summary = (
         results_df
-        .groupby("C", as_index=False)
+        .groupby(
+            ["C", "Calibration"],
+            as_index=False,
+        )
         .agg(
             MeanAccuracy=("Accuracy", "mean"),
             MeanLogLoss=("LogLoss", "mean"),
             MeanBrierScore=("BrierScore", "mean"),
-            TotalDrawPredictions=(
-                "DrawPredictions",
-                "sum",
-            ),
+            TotalDrawPredictions=("DrawPredictions", "sum"),
+            TotalActualDraws=("ActualDraws", "sum"),
+            TotalCorrectDraws=("CorrectDraws", "sum"),
+            MeanDrawProbability=("MeanDrawProbability", "mean"),
+            MeanActualDrawRate=("ActualDrawRate", "mean"),
+            TotalMatches=("Matches", "sum"),
         )
-        .sort_values(
-            ["MeanLogLoss", "C"],
-        )
-        .reset_index(drop=True)
     )
 
-    summary.to_csv(
-        TABLES_DIR / "logistic_tuning_summary.csv",
-        index=False,
+    summary["OverallDrawRecall"] = (
+        summary["TotalCorrectDraws"]
+        / summary["TotalActualDraws"]
     )
+
+    summary = summary.sort_values(
+        ["MeanLogLoss", "MeanBrierScore"]
+    ).reset_index(drop=True)
 
     print("\n" + "=" * 70)
-    print("TUNING SUMMARY")
+    print("TUNING SUMMARY - SORTED BY LOG LOSS")
     print("=" * 70)
 
     print(
         summary.round(5).to_string(index=False)
     )
 
-    best_c = float(
-        summary.iloc[0]["C"]
+    # ========================================================
+    # SAVE RESULTS
+    # ========================================================
+
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    print(f"\nBest C by validation log loss: {best_c}")
-
-    return best_c, summary
-
-
-# ============================================================
-# PLOT TUNING RESULTS
-# ============================================================
-
-def plot_tuning(summary):
-    ordered = summary.sort_values("C")
-
-    fig, ax = plt.subplots(figsize=(9, 6))
-
-    ax.plot(
-        ordered["C"],
-        ordered["MeanLogLoss"],
-        marker="o",
-        linewidth=2,
+    results_file = (
+        OUTPUT_DIR / "logistic_tuning_results.csv"
     )
 
-    ax.set_xscale("log")
-
-    ax.set_title(
-        "Logistic Regression Regularisation vs Validation Log Loss"
+    summary_file = (
+        OUTPUT_DIR / "logistic_tuning_summary.csv"
     )
 
-    ax.set_xlabel(
-        "Regularisation Strength Parameter (C)"
+    results_df.to_csv(
+        results_file,
+        index=False,
     )
 
-    ax.set_ylabel(
-        "Mean Validation Log Loss (Lower is Better)"
+    summary.to_csv(
+        summary_file,
+        index=False,
     )
 
-    ax.grid(
-        alpha=0.3,
-        which="both",
-    )
+    # ========================================================
+    # PRINT BENCHMARK
+    # ========================================================
 
-    fig.tight_layout()
+    benchmark = summary[
+        (summary["C"] == 0.01)
+        & (summary["Calibration"] == "none")
+    ]
 
-    path = (
-        FIGURES_DIR
-        / "logistic_regularisation_tuning.png"
-    )
-
-    fig.savefig(
-        path,
-        dpi=200,
-        bbox_inches="tight",
-    )
-
-    plt.close(fig)
-
-    print(f"\nSaved plot: {path}")
-
-
-# ============================================================
-# FINAL HOLDOUT TEST
-# ============================================================
-
-def final_test(df, best_c):
     print("\n" + "=" * 70)
-    print("FINAL HOLDOUT TEST: 2025/26")
+    print("CURRENT DEPLOYED CONFIGURATION")
     print("=" * 70)
 
-    train = df[
-        df["Season"] < TEST_SEASON
-    ]
+    if not benchmark.empty:
 
-    test = df[
-        df["Season"] == TEST_SEASON
-    ]
+        row = benchmark.iloc[0]
 
-    if len(test) != 380:
-        raise ValueError(
-            f"Expected 380 test matches, found {len(test)}"
+        print("Model: Logistic Regression")
+        print("C: 0.01")
+        print("Calibration: none")
+        print(
+            f"Validation accuracy: "
+            f"{row['MeanAccuracy']:.2%}"
+        )
+        print(
+            f"Validation log loss: "
+            f"{row['MeanLogLoss']:.5f}"
+        )
+        print(
+            f"Validation Brier score: "
+            f"{row['MeanBrierScore']:.5f}"
         )
 
-    model = create_model(best_c)
-
-    model.fit(
-        train[FEATURES],
-        train["FTR"],
-    )
-
-    metrics, predictions, probabilities = evaluate_model(
-        model,
-        test[FEATURES],
-        test["FTR"],
-    )
-
-    print(f"\nSelected C: {best_c}")
-
-    print(
-        f"Accuracy: {metrics['Accuracy']:.4f}"
-    )
-
-    print(
-        f"Log loss: {metrics['LogLoss']:.4f}"
-    )
-
-    print(
-        f"Brier score: {metrics['BrierScore']:.4f}"
-    )
-
-    print(
-        f"Draw predictions: {metrics['DrawPredictions']}"
-    )
-
-    comparison = pd.DataFrame([
-        {
-            "Model": "Tuned Logistic Regression + xG",
-            "C": best_c,
-            **metrics,
-        }
-    ])
-
-    comparison.to_csv(
-        TABLES_DIR / "tuned_logistic_test_results.csv",
-        index=False,
-    )
-
-    output = test[
-        [
-            "Date",
-            "Season",
-            "HomeTeam",
-            "AwayTeam",
-            "FTR",
-        ]
-    ].copy()
-
-    output["Prediction"] = predictions
-
-    for i, outcome in enumerate(CLASSES):
-        output[
-            f"Prob_{outcome}"
-        ] = probabilities[:, i]
-
-    output.to_csv(
-        TABLES_DIR
-        / "predictions_tuned_logistic_xg_2526.csv",
-        index=False,
-    )
-
-    print("\nFinal test predictions saved.")
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    print(
-        "PITCHIQ — LOGISTIC REGRESSION HYPERPARAMETER TUNING"
-    )
-
-    print("-" * 70)
-
-    df = load_data()
-
-    best_c, summary = tune_regularisation(df)
-
-    plot_tuning(summary)
-
-    final_test(df, best_c)
+    print("\nResults saved to:")
+    print(results_file)
+    print(summary_file)
 
     print("\nTUNING COMPLETE")
+    print("The deployed model has not been modified.")
 
 
 if __name__ == "__main__":
