@@ -1,0 +1,45 @@
+
+name: PitchIQ Safe Update Preview
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * 0,1,2,5,6"
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-updates.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-updates.txt
+
+      - name: Check for new matches
+        run: python scripts/check_updates.py
+
+      - name: Generate safe dataset preview
+        run: python scripts/preview_update.py
+
+      - name: Validate preview features
+        run: python scripts/test_preview_features.py
+
+      - name: Upload preview dataset
+        uses: actions/upload-artifact@v4
+        with:
+          name: pitchiq-dataset-preview
+          path: backups/preview/premier_league_with_xg_preview.csv
+          if-no-files-found: error
+          retention-days: 7
