@@ -1,10 +1,10 @@
-
-from pathlib import Path
+﻿from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
+from scripts.build_features_v2 import compute_pre_match_features
 
 
 # ============================================================
@@ -13,7 +13,7 @@ import streamlit as st
 
 ROOT = Path(__file__).resolve().parent
 
-MODEL_FILE = ROOT / "models" / "pitchiq_model.joblib"
+MODEL_FILE = ROOT / "models" / "pitchiq_model_v2.joblib"
 DATA_FILE = (
     ROOT / "data" / "processed"
     / "premier_league_with_xg.csv"
@@ -56,7 +56,7 @@ OUTCOME_LABELS = {
 
 st.set_page_config(
     page_title="PitchIQ | Premier League Analytics",
-    page_icon="⚽",
+    page_icon="\u26bd",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -376,6 +376,7 @@ def build_prediction_features(
     away_team,
     as_of_date,
     expected_features,
+    current_elo,
 ):
     home_form, home_history, home_venue = recent_form(
         history, home_team, "Home", as_of_date
@@ -391,6 +392,14 @@ def build_prediction_features(
         )
         for feature in home_form
     }
+
+    # Reconstruct Elo ratings from completed fixtures using the same
+    # pre-match and same-day update rules as V2 training.
+    if "Diff_Elo" in expected_features:
+        differences["Diff_Elo"] = float(
+            current_elo.get(home_team, 1500.0)
+            - current_elo.get(away_team, 1500.0)
+        )
 
     X = pd.DataFrame([differences])
 
@@ -496,9 +505,9 @@ def main():
         """
         <div class="hero">
             <div class="eyebrow">
-                FOOTBALL ANALYTICS · MACHINE LEARNING
+                FOOTBALL ANALYTICS &middot; MACHINE LEARNING
             </div>
-            <div class="hero-title">⚽ PitchIQ</div>
+            <div class="hero-title">&#9917; PitchIQ</div>
             <div class="hero-subtitle">
                 Premier League Match Prediction & Analytics
             </div>
@@ -517,6 +526,13 @@ def main():
 
     model = artifact["model"]
     features = artifact["features"]
+
+    # Compute post-match Elo state from completed historical matches.
+    # Only uses results available in the bundled dataset.
+    _, current_elo = compute_pre_match_features(
+        matches.sort_values(["Date", "Season", "HomeTeam", "AwayTeam"]),
+        return_state=True,
+    )
 
     history = create_team_history(matches)
 
@@ -579,7 +595,7 @@ def main():
     )
 
     st.sidebar.caption(
-        "Model: Logistic Regression · C = 0.01"
+        "Model: Logistic Regression + Elo | C = 0.01"
     )
 
     if home_team == away_team:
@@ -639,7 +655,7 @@ def main():
     if st.button(
         "Generate match prediction",
         type="primary",
-        use_container_width=True,
+        width='stretch',
     ):
         X, metadata = build_prediction_features(
             history,
@@ -647,6 +663,7 @@ def main():
             away_team,
             as_of_date,
             features,
+            current_elo,
         )
 
         raw_probabilities = model.predict_proba(X)[0]
@@ -754,7 +771,7 @@ def main():
         st.dataframe(
             comparison.round(2),
             hide_index=True,
-            use_container_width=True,
+            width='stretch',
         )
 
         # ====================================================
@@ -808,7 +825,7 @@ def main():
                 st.dataframe(
                     display.iloc[::-1],
                     hide_index=True,
-                    use_container_width=True,
+                    width='stretch',
                 )
 
         # ====================================================
@@ -861,7 +878,7 @@ def main():
             st.dataframe(
                 display,
                 hide_index=True,
-                use_container_width=True,
+                width='stretch',
             )
 
         # ====================================================
@@ -883,7 +900,7 @@ def main():
             st.write(
                 "The model considers recent overall "
                 "form and home/away-specific form "
-                "over 3, 5 and 10 matches."
+                "over 3, 5 and 10 matches, plus Elo team-strength ratings."
             )
 
             st.write(
@@ -895,12 +912,12 @@ def main():
             )
 
             st.write(
-                "**Input features:** 30"
+                f"**Input features:** {len(features)}"
             )
 
             st.write(
                 "**Historical validation log loss:** "
-                "approximately 0.967"
+                "approximately 0.957 (Elo V2)"
             )
 
             st.write(

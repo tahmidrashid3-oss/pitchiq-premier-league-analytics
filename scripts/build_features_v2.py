@@ -1,4 +1,4 @@
-"""Build PitchIQ V2 features without modifying the production dataset.
+﻿"""Build PitchIQ V2 features without modifying the production dataset.
 
 Adds leakage-safe pre-match Elo and Premier-League-only rest-day features.
 Same-day fixtures are processed as a batch before any ratings are updated.
@@ -41,7 +41,7 @@ def load_data():
     return matches.sort_values(KEY).reset_index(drop=True), base
 
 
-def compute_pre_match_features(matches):
+def compute_pre_match_features(matches, return_state=False):
     elo = {}
     last_match_date = {}
     rows = []
@@ -88,7 +88,10 @@ def compute_pre_match_features(matches):
             last_match_date[home] = date
             last_match_date[away] = date
 
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    if return_state:
+        return result, dict(elo)
+    return result
 
 
 def main():
@@ -110,3 +113,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
