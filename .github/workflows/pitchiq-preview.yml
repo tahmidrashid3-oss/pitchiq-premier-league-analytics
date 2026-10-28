@@ -1,5 +1,4 @@
-
-name: PitchIQ Safe Update Preview
+﻿name: PitchIQ Automatic Match Updates
 
 on:
   workflow_dispatch:
@@ -9,13 +8,22 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: pitchiq-match-updates
+  cancel-in-progress: false
+
 jobs:
-  preview:
+  publish:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -30,16 +38,32 @@ jobs:
       - name: Check for new matches
         run: python scripts/check_updates.py
 
-      - name: Generate safe dataset preview
+      - name: Generate preview
         run: python scripts/preview_update.py
 
-      - name: Validate preview features
+      - name: Validate model features
         run: python scripts/test_preview_features.py
 
-      - name: Upload preview dataset
+      - name: Publish validated data
+        run: python scripts/publish_update.py
+
+      - name: Upload preview artifact
         uses: actions/upload-artifact@v4
         with:
           name: pitchiq-dataset-preview
           path: backups/preview/premier_league_with_xg_preview.csv
-          if-no-files-found: error
           retention-days: 7
+
+      - name: Commit updated dataset
+        run: |
+          if git diff --quiet -- data/processed/premier_league_with_xg.csv; then
+            echo "No new data to publish."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/processed/premier_league_with_xg.csv
+          git commit -m "Automatically update Premier League results"
+          git push origin HEAD:main
