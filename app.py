@@ -13,7 +13,7 @@ from scripts.build_features_v2 import compute_pre_match_features
 
 ROOT = Path(__file__).resolve().parent
 
-MODEL_FILE = ROOT / "models" / "pitchiq_model_v2.joblib"
+MODEL_FILE = ROOT / "models" / "pitchiq_model.joblib"
 DATA_FILE = (
     ROOT / "data" / "processed"
     / "premier_league_with_xg.csv"
@@ -242,7 +242,7 @@ def load_model():
     if not MODEL_FILE.exists():
         raise FileNotFoundError(
             "Model missing. Run "
-            "python scripts/train_final_model.py"
+            "python scripts/train_model_v2.py"
         )
 
     return joblib.load(MODEL_FILE)
@@ -937,3 +937,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
