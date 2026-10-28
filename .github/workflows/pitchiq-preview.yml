@@ -3,6 +3,8 @@ name: PitchIQ Safe Update Preview
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * 0,1,2,5,6"
 
 permissions:
   contents: read
